@@ -1,0 +1,242 @@
+#!/bin/bash
+# checksumpackage
+# make checksum.md5 via hashdeep for package
+# version 1.1 adds use of dfxml
+# version 1.2 fixes + add options to check and verify existing checksums
+VERSION=1.2
+
+SCRIPTDIR=$(dirname "${0}")
+. "${SCRIPTDIR}/mmfunctions" || { echo "Missing '${SCRIPTDIR}/mmfunctions'. Exiting." ; exit 1 ;};
+unset DEPENDENCIES
+DEPENDENCIES=(hashdeep xml "${SCRIPTDIR}/removeDSStore")
+
+# local variables
+CHECKSUMNAME="checksum.md5"
+DFXMLNAME="dfxml.xml"
+CHECKSUMPROCESSLOG="checksumchecks.log"
+
+_usage(){
+    echo
+    echo "$(basename "${0}") ${VERSION}"
+    echo "This application will create a checksum from a directory or package input with the following options. Actions and results will be logged to ${CHECKSUMPROCESSLOG}."
+    echo "Dependencies: ${DEPENDENCIES[@]}"
+    echo "Usage: $(basename "${0}") directoryorpackage1 [ directoryorpackage2 ...]"
+    echo "  -c ( check filenames and filesizes in objects directory are the same as in existing checksum files, if none exists it will make the initial ones )"
+    echo "  -u ( valid only if -c is used. If the check is unsuccessful then make new checksums and version the previous ones. )"
+    echo "  -v ( fully verify checksum files against checksum files, if none exists it will make the initial ones. Note verification will version existing checksums and make new ones and log the difference to ${CHECKSUMPROCESSLOG})"
+    echo "  -h ( display this help )"
+    echo
+    exit
+}
+[ "${#}" = 0 ] && _usage
+_check_dependencies "${DEPENDENCIES[@]}"
+if [[ $(echo "$(hashdeep -V) >= 4.4" | bc) = 0 ]] ; then
+    _report -wt "$(basename "${0}") requires hashdeep 4.4 or greater."
+    _writeerrorlog "checksumpackage" "checksumpackage was unable to run because hashdeep 4.4 or greater is required."
+    exit 1
+fi
+_cleanup(){
+    _log -a "Process aborted"
+    exit 1
+}
+
+user_input="${*}"
+# command-line options
+CHECK=""
+VERIFY=""
+UPDATE=""
+OPTIND=1
+while getopts ":cvuh" OPT ; do
+   case "${OPT}" in
+       c) CHECK="Y";;
+       v) VERIFY="Y";;
+       u) UPDATE="Y";;
+       h) _usage ;;
+       *) echo "bad option -${OPTARG}" ; _usage ;;
+       :) echo "Option -${OPTARG} requires an argument" ; _writeerrorlog "checksumpackage" "You used an invalid option and the script had to exit" ; exit 1 ;;
+   esac
+done
+shift $(( ${OPTIND} - 1 ))
+
+trap _cleanup SIGHUP SIGINT SIGTERM
+
+_check_dfxml(){
+    PACKAGE="${ABS_PATH}"
+    # make temp file that lists filenames and filesizes from dfxml.xml
+    DFXML_FILELIST="$(_maketemp)"
+    if [ ! -z "$(xml sel -T -t -m "/_:dfxml/_:fileobject" -v "_:filename" -o " " -v "_:filesize" -n "${PACKAGE}/${OUTDIR}/${DFXMLNAME}" 2>/dev/null)" ] ; then
+        xml sel -T -t -m "/_:dfxml/_:fileobject" -v "_:filename" -o " " -v "_:filesize" -n "${PACKAGE}/${OUTDIR}/${DFXMLNAME}" | sort > "${DFXML_FILELIST}"
+    else
+        xml sel -T -t -m "/dfxml/fileobject" -v "filename" -o " " -v "filesize" -n "${PACKAGE}/${OUTDIR}/${DFXMLNAME}" | sort > "${DFXML_FILELIST}"
+    fi
+    PWD=$(pwd)
+    # make temp file that lists filenames and filesizes from current objects directory
+    NEW_FILELIST="$(_maketemp)"
+    cd "${PACKAGE}/${INDIR}"
+    find . -type f ! -name '.DS_Store' | while read i ; do
+        echo -n "$i "
+        ls -l "$i" | awk '{print $5}'
+    done | sort > "${NEW_FILELIST}"
+    cd "${PWD}"
+    # compare them
+    if [[ $(diff "${DFXML_FILELIST}" "${NEW_FILELIST}") ]] ; then
+        _report -wt "filepaths and sizes are different for ${1}"
+        diff "${DFXML_FILELIST}" "${NEW_FILELIST}"
+        echo "$(_get_iso8601): $(basename "${0}"):${VERSION}: failed to verify by filepath and size" >> "${PACKAGE}/${OUTDIR}/${CHECKSUMPROCESSLOG}"
+        rm "${DFXML_FILELIST}" "${NEW_FILELIST}"
+        CHECKERR=0
+    else
+        _report -dt "filepaths and sizes are still valid for ${1}"
+        echo "$(_get_iso8601): $(basename "${0}"):${VERSION}: verified by filepath and size" >> "${PACKAGE}/${OUTDIR}/${CHECKSUMPROCESSLOG}"
+        rm "${DFXML_FILELIST}" "${NEW_FILELIST}"
+        CHECKERR=1
+    fi
+}
+
+_version_dfxml(){
+    PACKAGE="${ABS_PATH}"
+    _report -wdt "Creating a new version of the checksum files."
+    LASTMD5="${PACKAGE}/${OUTDIR}/${CHECKSUMNAME%.*}_$(stat -t '%Y%m%d-%H%M%S' -l "${PACKAGE}/${OUTDIR}/${CHECKSUMNAME}" | awk '{print $6}').md5"
+    LASTDFXML="${PACKAGE}/${OUTDIR}/${DFXMLNAME%.*}_$(stat -t '%Y%m%d-%H%M%S' -l "${PACKAGE}/${OUTDIR}/${DFXMLNAME}" | awk '{print $6}').xml"
+    mv -v "${PACKAGE}/${OUTDIR}/${CHECKSUMNAME}" "${LASTMD5}"
+    mv -v "${PACKAGE}/${OUTDIR}/${DFXMLNAME}" "${LASTDFXML}"
+    echo "$(_get_iso8601): $(basename "${0}"):${VERSION}: checksums are versioned - ${DFXMLNAME} -> ${LASTDFXML}" >> "${PACKAGE}/${OUTDIR}/${CHECKSUMPROCESSLOG}"
+    echo "$(_get_iso8601): $(basename "${0}"):${VERSION}: checksums are versioned - ${CHECKSUMNAME} -> ${LASTMD5}" >> "${PACKAGE}/${OUTDIR}/${CHECKSUMPROCESSLOG}"
+}
+
+while [ "${*}" != "" ] ; do
+    if [ ! -d "$1" ] ; then
+        _report -wt "$1 is not a valid directory. Exiting"
+        exit 1
+    fi
+    ABS_PATH=$(cd "$1"; pwd)
+    INPUT=$(basename "$1")
+    _log -b
+    PACKAGE="${ABS_PATH}"
+    if [ -d "${PACKAGE}" ] ; then
+        PWD=$(pwd)
+        "${SCRIPTDIR}/removeDSStore" "${PACKAGE}"
+        if [ -d "${PACKAGE}/objects" ] ; then
+            INDIR="objects"
+            OUTDIR="metadata"
+        else
+            INDIR="."
+            OUTDIR="."
+        fi
+        #perform checking and verification
+        if [ "${CHECK}" = "Y" ] ; then
+            _report_to_db
+            if [ -s "${PACKAGE}/${OUTDIR}/${DFXMLNAME}" ] ; then
+                _check_dfxml "${PACKAGE}"
+                if [ "${CHECKERR}" != "0" ] ; then
+                    shift
+                    continue
+                else
+                    if [ "${UPDATE}" = "Y" ] ; then
+                        _version_dfxml "${PACKAGE}"
+                    else
+                        shift
+                        continue
+                    fi
+                fi
+            else
+                _report -dt "There is no dfxml.xml to check in ${PACKAGE}, skipping."
+                _writeerrorlog "checksumpackage" "There was no dfxml.xml to check in ${PACKAGE}, so it was skipped."
+                shift
+                continue
+            fi
+        elif [ "${VERIFY}" = "Y" ] ; then
+            if [ -s "${PACKAGE}/${OUTDIR}/${CHECKSUMNAME}" ] ; then
+                _report -dt "Prepping for dfxml.xml verification."
+            else
+                _report -dt "There is no dfxml.xml to verify in ${PACKAGE}, skipping."
+                _writeerrorlog "checksumpackage" "There was no dfxml.xml to verify in ${PACKAGE}, so it was skipped."
+                shift
+                continue
+            fi
+        elif [ "${UPDATE}" = "Y" ] ; then
+            _report -dt "Preparing to update package"
+        else
+            if [ -s "${PACKAGE}/${OUTDIR}/${CHECKSUMNAME}" ] ; then
+                _report -dt "${CHECKSUMNAME} already exists, skipping for ${PACKAGE}"
+                shift
+                continue
+            fi
+        fi
+        #create digital forensics xml and checksum.md5 file
+        _report -dt "making Digital Forensics XML (${DFXMLNAME}) and (${CHECKSUMNAME}) for ${PACKAGE}"
+        cd "${PACKAGE}/${INDIR}"
+        DFXMLTMP=$(_maketemp)
+        hashdeep -c md5 -edrl . > "${DFXMLTMP}"
+        cd "${PWD}"
+        [ ! -d "${PACKAGE}/${OUTDIR}" ] && mkdir -p "${PACKAGE}/${OUTDIR}"
+        echo "$(_get_iso8601): $(basename "${0}"):${VERSION}: ${DFXMLNAME} is generated" >> "${PACKAGE}/${OUTDIR}/${CHECKSUMPROCESSLOG}"
+        if [ "${VERIFY}" = "Y" ] ; then
+            _version_dfxml "${PACKAGE}"
+        elif [ "${UPDATE}" = "Y" ] ; then
+            _version_dfxml "${PACKAGE}"
+        fi
+        cat "${DFXMLTMP}" > "${PACKAGE}/${OUTDIR}/${DFXMLNAME}"
+        if [ ! -z "$(xml sel -T -t -m "/_:dfxml/_:fileobject" -v "_:filename" -o " " -v "_:filesize" -n "${PACKAGE}/${OUTDIR}/${DFXMLNAME}" 2>/dev/null)" ] ; then
+            xml sel -T -t -m "/_:dfxml/_:fileobject" -v "_:hashdigest" -o "  " -v "_:filename" -n "${PACKAGE}/${OUTDIR}/${DFXMLNAME}" > "${PACKAGE}/${OUTDIR}/${CHECKSUMNAME}"
+        else
+            xml sel -T -t -m "/dfxml/fileobject" -v "hashdigest" -o "  " -v "filename" -n "${PACKAGE}/${OUTDIR}/${DFXMLNAME}" > "${PACKAGE}/${OUTDIR}/${CHECKSUMNAME}"
+        fi
+        db_source="${PACKAGE}/${OUTDIR}/${CHECKSUMNAME}"
+        db_fixity=$(cat "${PACKAGE}/${OUTDIR}/${CHECKSUMNAME}")
+        _report_to_db
+        echo "$(_get_iso8601): $(basename "${0}"):${VERSION}: ${CHECKSUMNAME} is generated" >> "${PACKAGE}/${OUTDIR}/${CHECKSUMPROCESSLOG}"
+        event_outcome="Fixity Creation"
+        
+        if [ "${UPDATE}" = "Y" ] ; then
+            exit
+        fi
+        if [ "${VERIFY}" = "Y" ] ; then
+            #verify checksums by creating tmp checksum file and comparing with previously created checksums
+            CHECKSUMCMP1=$(_maketemp)
+            sort -k2 "${PACKAGE}/${OUTDIR}/${CHECKSUMNAME}" > "${CHECKSUMCMP1}"
+            CHECKSUMCMP2=$(_maketemp)
+            sort -k2 "${LASTMD5}" > "${CHECKSUMCMP2}"
+            if [[ $(diff "${CHECKSUMCMP1}" "${CHECKSUMCMP2}") ]] ; then
+                #setup check for file paths
+                original_file_manifest=$(cat "${CHECKSUMCMP2}" | cut -c 37-)
+                new_file_manifest=$(cat "${CHECKSUMCMP1}" | cut -c 37-)
+                manifest_check=$(diff <(echo "$original_file_manifest") <(echo "$new_file_manifest"))
+                originalhash_list=$(grep "$original_file_manifest" "${CHECKSUMCMP1}")
+                originalhash_check=$(diff <(echo "$originalhash_list") "${CHECKSUMCMP2}")
+
+                # Check if mismatch is result of checksum or file path differences
+                if [ -n "${manifest_check}" ] ; then
+                    _report -wt "File paths are different for ${PACKAGE}. Files have either been added, renamed or removed."
+                    echo "The following files have been added: $(echo "$manifest_check" | grep ">" | cut -c 3-)"
+                     echo "The following files have been removed: $(echo "$manifest_check" | grep "<" | cut -c 3-)"
+                    echo "$(_get_iso8601): $(basename "${0}"):${VERSION}: FAILED to VERIFY due to file path differences - compare ${CHECKSUMNAME} and $(basename "${LASTMD5}")" >> "${PACKAGE}/${OUTDIR}/${CHECKSUMPROCESSLOG}"
+                    event_outcome="Fixity Mismatch"
+                fi
+
+                if [ -n "${originalhash_check}" ] ; then
+                _report -wt "checksums are different for ${PACKAGE}"
+                diff "${CHECKSUMCMP1}" "${CHECKSUMCMP2}"
+                echo "$(_get_iso8601): $(basename "${0}"):${VERSION}: FAILED to VERIFY by checksums - compare ${CHECKSUMNAME} and $(basename "${LASTMD5}")" >> "${PACKAGE}/${OUTDIR}/${CHECKSUMPROCESSLOG}"
+                event_outcome="Fixity Mismatch"
+            fi
+            else
+                _report -dt "checksums are still valid for ${PACKAGE}"
+                echo "$(_get_iso8601): $(basename "${0}"):${VERSION}: verified by checksums" >> "${PACKAGE}/${OUTDIR}/${CHECKSUMPROCESSLOG}"
+                event_outcome="Fixity Match"
+            fi
+        
+            rm "${CHECKSUMCMP1}" "${CHECKSUMCMP2}"
+        fi
+        #if [ "$FILEMAKER_XML_URL" ] ; then
+            #"${SCRIPTDIR}/checksum2filemaker" "${PACKAGE}"
+            #fi
+    else
+        _report -dt "ERROR: ${0} requires directories as input and ${PACKAGE} is not a directory."
+    fi
+    _eventoutcome_update
+    _report_fixity_db
+    _db_email_delivery "${SQL_ERROR_EMAIL_TO}"
+    _log -e
+    shift
+done

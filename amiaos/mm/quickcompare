@@ -1,0 +1,21 @@
+#!/bin/bash
+checksize=512000
+# quick file compare, not completely authoritative but decent in a short amount of time
+
+SCRIPTDIR=$(dirname "${0}")
+. "${SCRIPTDIR}/mmfunctions" || { echo "Missing '${SCRIPTDIR}/mmfunctions'. Exiting." ; exit 1 ;};
+
+_cleanup(){
+    _log -a "Process aborted"
+    exit 1
+}
+
+trap _cleanup SIGHUP SIGINT SIGTERM
+_log -b
+
+[ ! "${#}" = "2" ] && { echo Use two possibly similar files are arguments. ; exit 1 ;};
+#[ ! $(du "${1}" | cut -f1) = $(du "$2" | cut -f1) ] && echo The files are different sizes
+[ ! $(head -c "${CHECKSIZE}" "${1}" | md5) = $(head -c "${CHECKSIZE}" "${2}" | md5) ] && echo The first "${CHECKSIZE}" bytes have different md5s.
+[ ! $(tail -c "${CHECKSIZE}" "${1}" | md5) = $(tail -c "${CHECKSIZE}" "${2}" | md5) ] && echo The last "${CHECKSIZE}" bytes have different md5s.
+
+_log -e

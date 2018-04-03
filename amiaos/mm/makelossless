@@ -1,0 +1,108 @@
+#!/bin/bash
+# makelossless
+#this script is not actively maintained.
+VERSION="1.0"
+SCRIPTDIR=$(dirname $(which "${0}"))
+. "${SCRIPTDIR}/mmfunctions" || { echo "Missing '${SCRIPTDIR}/mmfunctions'. Exiting." ; exit 1 ;};
+DEPENDENCIES=(ffmpeg ffprobe mediainfo)
+_initialize_make
+
+_usage(){
+    echo
+    echo "$(basename "${0}") ${VERSION}"
+    echo "This application will losslessly transcode a video file or package input with the following options."
+    echo "Dependencies: ${DEPENDENCIES[@]}"
+    echo "Usage: $(basename ${0}) fileorpackage1 [ fileorpackage2 ...]"
+    echo "  -j (use lossless jpeg2000 instead of ffv1 version 3)"
+    echo "  -n (dry-run mode, show the commands that would be run but don't do anything)"
+    echo "  -h display this help"
+    echo
+    exit
+}
+[ "${#}" = 0 ] && _usage
+
+# command-line options to set mediaid and original variables
+OPTIND=1
+while getopts ":jnh" OPT ; do
+    case "${OPT}" in
+        j) JPEG2000MODE="Y";;
+        n) DRYRUN=true;;
+        h) _usage ;;
+        *) echo "bad option -${OPTARG}" ; _usage ;;
+        :) echo "Option -${OPTARG} requires an argument" ; _writeerrorlog "makelossless" "The option selected required an argument and none was provided. The script had to exit." ; exit 1 ;;
+    esac
+done
+shift $(( ${OPTIND} - 1 ))
+
+while [ "${*}" != "" ] ; do
+    # get context about the input
+    INPUT="${1}"
+    [ -d "${INPUT}" ] && LOGDIR="${INPUT}/metadata/logs"
+    [ -f "${INPUT}" ] && LOGDIR="$(dirname "${INPUT}")/lossless/logs"
+    [ ! "${LOGDIR}" ] && LOGDIR="${INPUT}/metadata/logs"
+
+    find "${INPUT}" -type f \( -iname "*.mov" -o -iname "*.avi" -o -iname "*.mxf" \) -print0 | while read -d $'\0' SOURCEFILE ; do
+        OUTPUTDIR=$(dirname "${SOURCEFILE}")
+        SOURCEFILENAME=$(basename "${SOURCEFILE}")
+
+        _log -b
+
+        # clear local arrays
+        _unset_variables
+
+        # encoding options
+        _get_codectagstring "${SOURCEFILE}"
+        _get_videostreamcount "${SOURCEFILE}"
+        _get_audiostreamcount "${SOURCEFILE}"
+        INPUTOPTIONS+=(-nostdin)
+        INPUTOPTIONS+=(-vsync 0)
+        if [[ "${VIDEOSTREAMCOUNT}" > 0 ]] ; then
+            if [[ "${CODEC_TAG_STRING}" == "mjp2" ]] ; then
+                 INPUTOPTIONS+=(-vcodec libopenjpeg)
+            fi
+            MIDDLEOPTIONS+=(-map 0:v)
+            MIDDLEOPTIONS+=(-map 0:a)
+            if [[ "${JPEG2000MODE}" == "Y" ]] ; then
+                MIDDLEOPTIONS+=(-c:v libopenjpeg)
+                INPUTOPTIONSFRAMEMD5+=(-vcodec libopenjpeg)
+                SUFFIX="_j2k"
+            else
+                MIDDLEOPTIONS+=(-c:v ffv1 -level 3 -g 1)
+                SUFFIX="_ffv1"
+            fi
+            _add_video_filter "setfield=bff" # this is a presumption but much of the uncompressed input is bff but not probably labelled
+        fi
+        if [[ "${AUDIOSTREAMCOUNT}" > 0 ]] ; then
+            MIDDLEOPTIONS+=(-c:a copy)
+        fi
+        _get_codectagstring "${SOURCEFILE}"
+        _run mkdir -p "${OUTPUTDIR}" "${LOGDIR}"
+        if [ "${CODEC_TAG_STRING}" == "2vuy" -o "${CODEC_TAG_STRING}" == "v210" ] ; then
+            _report -dt "${SOURCEFILENAME} is ${CODEC_TAG_STRING}, starting encode"
+            _prep_ffmpeg_log
+
+            _filter_to_middle_option
+
+            _run_critical ffmpeg ${INPUTOPTIONS[@]} -i "${SOURCEFILE}"  ${MIDDLEOPTIONS[@]} "${OUTPUTDIR}/${SOURCEFILENAME%.*}${SUFFIX}.mov" -f framemd5 -an "${LOGDIR}/${SOURCEFILENAME%.*}.framemd5"
+            if [ "${CODEC_TAG_STRING}" == "2vuy" ] ; then
+                _run_critical ffmpeg ${INPUTOPTIONS[@]} -i "${OUTPUTDIR}/${SOURCEFILENAME%.*}${SUFFIX}.mov" -f framemd5 -pix_fmt uyvy422 -an "${LOGDIR}/${SOURCEFILENAME%.*}${SUFFIX}.framemd5"
+            else
+                _run_critical ffmpeg ${INPUTOPTIONS[@]} ${INPUTOPTIONSFRAMEMD5[@]} -i "${OUTPUTDIR}/${SOURCEFILENAME%.*}${SUFFIX}.mov" -f framemd5 -an "${LOGDIR}/${SOURCEFILENAME%.*}${SUFFIX}.framemd5"
+            fi
+            if [ $(grep -v "^#" "${LOGDIR}/${SOURCEFILENAME%.*}.framemd5" | md5 -q) = $(grep -v "^#" "${LOGDIR}/${SOURCEFILENAME%.*}${SUFFIX}.framemd5" | md5 -q) ] ; then
+                _report -dt "Everything looks safe. Going to delete the original."
+                _run_critical mediainfo -f --language=raw --output=XML "${SOURCEFILE}" > "${LOGDIR}/${SOURCEFILENAME%.*}_mediainfo.xml"
+                _run_critical rm -f -v "${SOURCEFILE}"
+            else
+                _report -wt "Not looking safe. Going to keep the original."
+            fi
+        else
+            _report -wt "${SOURCEFILENAME} is not 2vuy or v210 or progressive ffv1, skipping"
+            _writeerrorlog "makelossless" "The source file is not 2vuy or v210 or progressive ffv1, so makelossless was unable to run."
+            continue
+        fi
+        _report -dt done with "${SOURCEFILE}"
+    done
+    shift
+    _log -e
+done

@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+
+# renameschemas
+
+SCRIPTDIR=$(dirname "${0}")
+
+. "${SCRIPTDIR}/mmfunctions" || { echo "Missing '${SCRIPTDIR}/mmfunctions'. Exiting." ; exit 1 ; }
+
+if [[ $(dirname $(which "${0}")) = "/usr/local/bin" || $(dirname $(which "${0}")) = "${HOME}/.linuxbrew/bin" ]] ; then
+    VERSION=$(TMP=$(brew info ltopers | grep -Eo "/ltopers/.* \(") ; echo ${TMP:9:(${#TMP}-11)})
+else
+    VERSION=""
+fi
+
+_usage(){
+    cat <<EOF
+$(basename "${0}") ${VERSION}
+Currently this script only works with in -u mode. It finds all .schema
+LTFS indexes in the LTO_LOGS directory and renames them to use the
+top-level file system directory name rather than the uuid. Any
+conflicting filenames are moved to another folder if needed.
+
+Usage: $(basename "${0}") -u | -h
+  -u  change dir-named schema files to the tape uuid
+  -h  display this help
+EOF
+}
+
+[ "${#}" = 0 ] && { _usage ; exit 1 ; }
+
+OPTIND=1
+while getopts ":hu" opt ; do
+    case "${opt}" in
+        h) _usage ; exit 0 ;;
+        u) RENAME2UUID="Y" ;;
+        *) echo "Error: Bad option -${OPTARG}" ; _usage ; exit 1 ;;
+    esac
+done
+shift $(( ${OPTIND} - 1 ))
+
+LTO_LOGS="${LTO_INDEX_DIR}"
+OLD_LOGS="${LTO_LOGS}/old/"
+
+if [[ ! -d "${OLD_LOGS}" ]] ; then
+    mkdir -p "${OLD_LOGS}"
+fi
+
+if [[ "${RENAME2UUID}" = "Y" ]] ; then
+    ls -1t "${LTO_LOGS}" | grep "[0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}.schema" | while read UUID_NAME ; do
+        UUID_PATH="${LTO_LOGS}/${UUID_NAME}"
+        NAME_PATH="${LTO_LOGS}/$(xml sel -t -m "/ltfsindex" -v directory[1]/name "${LTO_LOGS}/${UUID_NAME}").schema"
+        if [[ -f "${NAME_PATH}" ]] ; then
+            UUID_UPDATETIME=$(xml sel -t -m "/ltfsindex" -v updatetime "${UUID_PATH}")
+            NAME_UPDATETIME=$(xml sel -t -m "/ltfsindex" -v updatetime "${NAME_PATH}")
+            if [[ "$UUID_UPDATETIME" < "$NAME_UPDATETIME" ]] ; then
+                mv -v "${UUID_PATH}" "${OLD_LOGS}"
+            else
+                mv -v "${NAME_PATH}" "${OLD_LOGS}"
+                mv -v -n "${UUID_PATH}" "${NAME_PATH}"
+            fi
+        else
+            mv -v -n "${UUID_PATH}" "${NAME_PATH}"
+        fi
+    done
+fi

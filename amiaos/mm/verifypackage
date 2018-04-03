@@ -1,0 +1,41 @@
+#!/bin/bash
+#verifypackage checks the validity of files created with makebroadcast, makeyoutube, and makedvd
+SCRIPTDIR=$(dirname "${0}")
+. "${SCRIPTDIR}/mmfunctions" || { echo "Missing '${SCRIPTDIR}/mmfunctions'. Exiting." ; exit 1 ;};
+unset DEPENDENCIES
+DEPENDENCIES=(mediaconch xmlstarlet)
+_initialize_make
+
+#input the package
+while [ "${*}" != "" ] ; do
+    PACKAGE="${1}"
+    MEDIAID=$(basename "${PACKAGE}")
+    shift
+#verify the makebroadcast file
+    if [ -f "${PACKAGE}/objects/service/${MEDIAID}.mov" ] ; then
+        STATUS=$(mediaconch -fx -p "${SCRIPTDIR}/makebroadcast_policies.xml" "${PACKAGE}/objects/service/${MEDIAID}.mov" | xml sel -N mc="https://mediaarea.net/mediaconch" -t -v mc:MediaConch/mc:media/mc:policy/@outcome -n)
+        if [[ "$STATUS" = "pass!" ]] ; then
+          _report -dt "Pass: ${PACKAGE}/objects/service/${MEDIAID}.mov"
+        else
+          mediaconch -fs -p "${SCRIPTDIR}/makebroadcast_policies.xml" "${PACKAGE}/objects/service/${MEDIAID}.mov"
+        fi
+    fi
+#verify the makeyoutube file
+    if [ -f "${PACKAGE}/objects/access/youtube_up/${MEDIAID}.mp4" ] ; then
+        STATUS=$(mediaconch -fx -p "${SCRIPTDIR}/makeyoutube_policies.xml" "${PACKAGE}/objects/access/youtube_up/${MEDIAID}.mp4" | xml sel -N mc="https://mediaarea.net/mediaconch" -t -v mc:MediaConch/mc:media/mc:policy/@outcome -n)
+        if [[ "$STATUS" = "pass!" ]] ; then
+            _report -dt "Pass: ${PACKAGE}/objects/access/youtube_up/${MEDIAID}.mp4"
+        else
+            mediaconch -fs -p "${SCRIPTDIR}/makeyoutube_policies.xml" "${PACKAGE}/objects/access/youtube_up/${MEDIAID}.mp4"
+        fi
+    fi
+#verify the makedvd file
+    if [ -f "${PACKAGE}/objects/access/dvd/${MEDIAID}.iso" ] ; then
+        STATUS=$(mediaconch -fx -p "${SCRIPTDIR}/makedvd_policies.xml" "${PACKAGE}/objects/access/dvd/${MEDIAID}.iso" | xml sel -N mc="https://mediaarea.net/mediaconch" -t -v mc:MediaConch/mc:media/mc:policy/@outcome -n)
+        if [[ "$STATUS" = "pass!" ]] ; then
+            _report -dt "Pass: ${PACKAGE}/objects/access/dvd/${MEDIAID}.iso"
+        else
+            mediaconch -fs -p "${SCRIPTDIR}/makedvd_policies.xml" "${PACKAGE}/objects/access/dvd/${MEDIAID}.iso"
+        fi
+    fi
+done
